@@ -1,0 +1,9 @@
+{
+  "window.autoDetectColorScheme": false,
+  "workbench.colorCustomizations": {
+    "editor.selectionBackground": "#3B82F6AA",
+    "editor.inactiveSelectionBackground": "#3B82F644",
+    "editor.selectionHighlightBackground": "#60A5FA33",
+    "editor.selectionForeground": "#ffffff"
+  }
+}
