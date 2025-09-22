@@ -356,3 +356,97 @@ const getContact = async (accessToken) => {
 - [Postgres](https://www.npmjs.com/package/pg)
 - [Axios](https://www.npmjs.com/package/axios)
 
+const storeTokens = async (tokens, portalId, client) => {
+  console.log('Checking if PostgresQL table is present')
+  const table = await createTable(client)
+
+  if (table) {
+    console.log('Table is present, storing tokens')
+    return await client.query('INSERT INTO hubtokens(portal_id, access_token, refresh_token, expires_in, updated_at) VALUES($1, $2, $3, $4, $5) RETURNING *', 
+    [portalId, tokens.access_token, tokens.refresh_token, tokens.expires_in, new Date()]).then((response) => {
+      console.log(`Succesfully stored tokens: ${response}`)
+      return tokens
+    }).catch(async e => {
+      console.log(e.constraint)
+      if (e.constraint === 'hubtokens_portal_id_key') {
+        console.log(`Record with ${portalId} already exists, updating record instead`) 
+        const result = await updateTokens(tokens, portalId, client)
+        return tokens
+      } else {
+        console.error(`Error while storing tokens: ${e.stack}`)
+        return false
+      }
+    })
+  } else {
+    console.log('Table is not present, could not store tokens')
+    return false
+  }
+}
+```
+
+The `createTable()` method will be called to create a table if there isn't an existing one linking to the same data. Then, the data will be inserted into the table and if a record with the same portal Id already exists, it will be updated by calling the `updateTokens()` method.
+
+If everything is sucessfully executed, the /oauth-callback endpoint will redirect the user to the /success endpoint which displays a message that everything went according to plan and you may close the page.
+
+```
+router.get('/success', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.write(`<h4>Succesfully installed integration, you can close the page</h4>`);
+  res.end();
+})
+```
+
+The installation should now be successfully completed.
+
+## Retrieving data
+
+---
+
+Since we can now retrieve an `access token`, we can use it to authorize to the HubSpot API and retrieve data through an `Axios` request. In the following example, we will create a GET requests and call the HubSpot API to retrieve contact data:
+
+```
+const getContact = async (accessToken) => {
+  console.log('Retrieving contact from HubSpot');
+  try {
+    const result = await axios({
+      method: 'get',
+      url: 'https://api.hubapi.com/contacts/v1/lists/all/contacts/all?count=1',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      }
+    }).then((response) => {
+      return response.data
+    }).catch((error) => {
+      console.log(error)
+    })
+
+    return result.contacts[0];
+  } catch (e) {
+    return e;
+  }
+};
+```
+
+## Documentation
+
+### Overview
+- [Project overview](https://developers.hubspot.com/docs/api/private-apps)
+
+### Setup
+- [BitBucket repository](https://bitbucket.org/bureau_bright/bright-databank)
+- [HubSpot Developer account](https://developers.hubspot.com/get-started)
+- [OAuth authorization](https://developers.hubspot.com/docs/api/working-with-oauth)
+- [Heroku](https://devcenter.heroku.com/categories/reference)
+- [PostgreSQL](https://www.postgresql.org/)
+
+### API
+- [HubSpot API reference documentation](https://developers.hubspot.com/docs/api/crm/properties)
+- [CRUD requests](https://en.wikipedia.org/wiki/Create,_read,_update_and_delete)
+
+### Dependencies
+- [Node.js](https://nodejs.org/en/)
+- [Express.js](https://expressjs.com/)
+- [Postgres](https://www.npmjs.com/package/pg)
+- [Axios](https://www.npmjs.com/package/axios)
+

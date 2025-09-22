@@ -4,10 +4,8 @@ const { RateLimiterMemory, RateLimiterQueue } = require('rate-limiter-flexible')
 const Sentry = require("@sentry/node");
 const { nodeProfilingIntegration } = require('@sentry/profiling-node')
 const { CronJob } = require('cron');
-// const dotenv = require('dotenv')
-// dotenv.config();
-const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+const axios = require('axios');
+require('dotenv').config(); // load root .env
 
 const app = express();
 const bodyParser = require('body-parser');
@@ -19,6 +17,7 @@ const { getRelations, getAllRelations } = require('./ridder/relations')
 const { handleDeals, findOrphanedDeals, deleteOrphanedDeals, checkDirectOrdersWithZeroAmount } = require('./hubspot/deals')
 const { handleContacts } = require('./hubspot/contacts')
 const { handleCompanies } = require('./hubspot/companies')
+const { ensureSchema, loadToken, saveToken } = require('./database')
 
 // HubSpot has an API limit of 100 requests per 10 seconds, set a limiter to prevent exceeding these limits, reduce it with the amount of search requests
 const APILimits = {
@@ -38,26 +37,25 @@ const searchRateLimiter = new RateLimiterMemory(searchLimits)
 const limiter = new RateLimiterQueue(rateLimiter)
 const searchLimiter = new RateLimiterQueue(searchRateLimiter)
 
-Sentry.init({
-  dsn: "https://229c6ad7e6cf55fc6ab479d74cf6d7c5@o36959.ingest.us.sentry.io/4507107917824001",
-  integrations: [
-    // enable HTTP calls tracing
-    new Sentry.Integrations.Http({ tracing: true }),
-    // enable Express.js middleware tracing
-    new Sentry.Integrations.Express({ app }),
-    nodeProfilingIntegration(),
-  ],
-  // Performance Monitoring
-  tracesSampleRate: 1.0, //  Capture 100% of the transactions
-  // Set sampling rate for profiling - this is relative to tracesSampleRate
-  profilesSampleRate: 1.0,
-});
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    integrations: [
+      new Sentry.Integrations.Http({ tracing: true }),
+      new Sentry.Integrations.Express({ app }),
+      nodeProfilingIntegration(),
+    ],
+    tracesSampleRate: 1.0,
+    profilesSampleRate: 1.0,
+  });
+}
 
-// The request handler must be the first middleware on the app
-app.use(Sentry.Handlers.requestHandler());
-
-// TracingHandler creates a trace for every incoming request
-app.use(Sentry.Handlers.tracingHandler());
+if (process.env.SENTRY_DSN) {
+  // The request handler must be the first middleware on the app
+  app.use(Sentry.Handlers.requestHandler());
+  // TracingHandler creates a trace for every incoming request
+  app.use(Sentry.Handlers.tracingHandler());
+}
 
 app.use(bodyParser.json({
   verify: (req, res, buf, encoding) => {
@@ -67,6 +65,227 @@ app.use(bodyParser.json({
   }
 }));
 
+// ==================== OAUTH TOKEN HANDLING ====================
+let hubspotTokens = {
+  portalId: 'default',
+  accessToken: process.env.HUBSPOT_TOKEN || null,
+  refreshToken: null,
+  expiresAt: null,
+  scopes: null
+}
+
+// Initialize DB token (if any) on startup
+; (async () => { // leading semicolon protects against ASI calling previous expression
+  try {
+    const schemaReady = await ensureSchema();
+    if (schemaReady) {
+      const existing = await loadToken('default');
+      if (existing) {
+        hubspotTokens.portalId = existing.portal_id;
+        hubspotTokens.accessToken = existing.access_token;
+        hubspotTokens.refreshToken = existing.refresh_token;
+        hubspotTokens.expiresAt = existing.expires_at ? new Date(existing.expires_at).getTime() : null;
+        hubspotTokens.scopes = existing.scopes;
+        console.log('[oauth] Loaded token from DB for portal', existing.portal_id);
+      } else {
+        console.log('[oauth] No existing token row found in DB');
+      }
+    } else {
+      console.warn('[oauth] DB schema not ready, continuing in memory-only mode');
+    }
+  } catch (e) {
+    console.error('[oauth] Startup token load failed, memory-only mode active:', e.message);
+  }
+})();
+
+// Periodically retry DB availability and persist token if previously memory-only
+setInterval(async () => {
+  try {
+    // Only act if we have an access token in memory and either no DB schema yet or token row missing
+    const schemaReady = await ensureSchema();
+    if (!schemaReady) return; // still unreachable
+    const existing = await loadToken(hubspotTokens.portalId || 'default');
+    if (!existing && hubspotTokens.accessToken) {
+      await saveToken({
+        portal_id: hubspotTokens.portalId || 'default',
+        access_token: hubspotTokens.accessToken,
+        refresh_token: hubspotTokens.refreshToken,
+        expires_at: hubspotTokens.expiresAt ? new Date(hubspotTokens.expiresAt) : null,
+        scopes: hubspotTokens.scopes || (process.env.HUBSPOT_SCOPES || '')
+      });
+      console.log('[oauth] Backfilled in-memory token to DB after reconnect');
+    }
+  } catch (e) {
+    // silent-ish; log once every few failures could be added later
+  }
+}, 30_000); // every 30s
+
+const getAccessToken = async () => {
+  if (!hubspotTokens.accessToken && process.env.HUBSPOT_TOKEN) return process.env.HUBSPOT_TOKEN;
+  if (!hubspotTokens.accessToken) throw new Error('No HubSpot access token available. Visit /install to authorize.');
+  if (hubspotTokens.expiresAt && Date.now() > hubspotTokens.expiresAt - 60_000 && hubspotTokens.refreshToken) {
+    await refreshAccessToken();
+  }
+  return hubspotTokens.accessToken;
+}
+
+const refreshAccessToken = async () => {
+  try {
+    const params = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: process.env.CLIENT_ID,
+      client_secret: process.env.CLIENT_SECRET,
+      refresh_token: hubspotTokens.refreshToken
+    });
+    const resp = await axios.post('https://api.hubapi.com/oauth/v1/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    hubspotTokens.accessToken = resp.data.access_token;
+    hubspotTokens.expiresAt = Date.now() + (resp.data.expires_in * 1000);
+    if (resp.data.refresh_token) hubspotTokens.refreshToken = resp.data.refresh_token;
+    await saveToken({
+      portal_id: hubspotTokens.portalId || 'default',
+      access_token: hubspotTokens.accessToken,
+      refresh_token: hubspotTokens.refreshToken,
+      expires_at: new Date(hubspotTokens.expiresAt),
+      scopes: hubspotTokens.scopes || (process.env.HUBSPOT_SCOPES || '')
+    });
+    console.log('Refreshed HubSpot access token and persisted');
+  } catch (err) {
+    console.error('Failed to refresh HubSpot token', err.response?.data || err.message);
+    Sentry.captureException?.(err);
+    throw err;
+  }
+}
+
+app.get('/install', (req, res) => {
+  try {
+    const scopes = process.env.HUBSPOT_SCOPES || 'oauth';
+    const redirectUri = encodeURIComponent(process.env.REDIRECT_URI || 'http://localhost:3000/oauth/callback');
+    const authUrl = `https://app-eu1.hubspot.com/oauth/authorize?client_id=${process.env.CLIENT_ID}&redirect_uri=${redirectUri}&scope=${encodeURIComponent(scopes)}`;
+    return res.redirect(authUrl);
+  } catch (e) {
+    console.error('/install error', e);
+    return res.status(500).json({ error: 'Failed to start OAuth install' });
+  }
+});
+
+app.get('/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send('Missing code');
+  try {
+    const params = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: process.env.CLIENT_ID,
+      client_secret: process.env.CLIENT_SECRET,
+      redirect_uri: process.env.REDIRECT_URI || 'http://localhost:3000/oauth/callback',
+      code
+    });
+    const resp = await axios.post('https://api.hubapi.com/oauth/v1/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    hubspotTokens.accessToken = resp.data.access_token;
+    hubspotTokens.refreshToken = resp.data.refresh_token;
+    hubspotTokens.expiresAt = Date.now() + (resp.data.expires_in * 1000);
+    hubspotTokens.scopes = (process.env.HUBSPOT_SCOPES || '').trim();
+
+    // Attempt hub info lookup for portal id
+    try {
+      const hubInfo = await axios.get(`https://api.hubapi.com/oauth/v1/access-tokens/${hubspotTokens.accessToken}`);
+      if (hubInfo.data && hubInfo.data.hub_id) {
+        hubspotTokens.portalId = String(hubInfo.data.hub_id);
+      }
+    } catch (e) {
+      console.warn('Could not retrieve hub info, using default portal id:', e.response?.data || e.message);
+    }
+
+    await saveToken({
+      portal_id: hubspotTokens.portalId,
+      access_token: hubspotTokens.accessToken,
+      refresh_token: hubspotTokens.refreshToken,
+      expires_at: new Date(hubspotTokens.expiresAt),
+      scopes: hubspotTokens.scopes
+    });
+    console.log('OAuth success. Token stored for portal', hubspotTokens.portalId);
+    return res.send(`Authorization successful. Portal ${hubspotTokens.portalId}. Token persisted.`);
+  } catch (err) {
+    console.error('OAuth callback error', err.response?.data || err.message);
+    Sentry.captureException?.(err);
+    return res.status(500).send('OAuth exchange failed');
+  }
+});
+
+app.get('/debug/token', (req, res) => {
+  if (!hubspotTokens.accessToken) return res.json({ hasAccessToken: false });
+  res.json({
+    hasAccessToken: true,
+    expiresAt: hubspotTokens.expiresAt,
+    willRefreshInMs: hubspotTokens.expiresAt ? (hubspotTokens.expiresAt - Date.now()) : null
+  });
+});
+
+// Limited DB token inspection (no raw token leakage)
+app.get('/debug/db', async (req, res) => {
+  try {
+    const row = await loadToken(hubspotTokens.portalId || 'default');
+    if (!row) return res.json({ inDb: false });
+    return res.json({
+      inDb: true,
+      portal_id: row.portal_id,
+      has_access_token: !!row.access_token,
+      expires_at: row.expires_at,
+      scopes: row.scopes
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Simple DB health check
+app.get('/health/db', async (req, res) => {
+  try {
+    const start = Date.now();
+    const p = require('./database').getPool();
+    if (!p) return res.status(200).json({ ok: false, reason: 'pool-not-initialized (memory-mode)', latencyMs: 0 });
+    const r = await p.query('SELECT 1 as ok');
+    return res.json({ ok: true, result: r.rows[0].ok, latencyMs: Date.now() - start });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// DNS diagnostics for DB host
+app.get('/debug/dns', async (req, res) => {
+  const dns = require('dns');
+  const host = (process.env.DATABASE_URL || '').match(/@([^/:]+)(?::\d+)?\//)?.[1];
+  if (!host) return res.json({ error: 'No host parsed from DATABASE_URL' });
+  const servers = dns.getServers();
+  const result = { host, servers, lookups: {} };
+  const families = [4, 6];
+  await Promise.all(families.map(f => new Promise(resolve => {
+    dns.lookup(host, { family: f }, (err, address, family) => {
+      result.lookups['ipv' + f] = err ? { error: err.code || err.message } : { address, family };
+      resolve();
+    });
+  })));
+  // Resolve A/AAAA specifically
+  await Promise.all(['resolve4','resolve6'].map(m => new Promise(resolve => {
+    dns[m](host, (err, addresses) => {
+      result[m] = err ? { error: err.code || err.message } : addresses;
+      resolve();
+    });
+  })));
+  return res.json(result);
+});
+
+// Alternate postgres client test (pooler experimentation)
+app.get('/debug/pg2', async (req, res) => {
+  try {
+    const { testConnection } = require('./database/db_postgres_client');
+    const r = await testConnection();
+    return res.status(r.ok ? 200 : 500).json(r);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ==================== ORIGINAL SYNC LOGIC ====================
 const runIntegration = async () => {
   console.log('Running sync every minute, retrieving updated offers, contacts and companies from Ridder Unitura Projects')
   const projectOffers = await getOffers(true)
@@ -146,44 +365,50 @@ const cleanupOrphanedDeals = async () => {
 };
 
 // Cron job that runs every minute from Ridder to HubSpot
-CronJob.from({
-  cronTime: '0 * * * * *', // Run every minute
-  runOnInit: true,
-  onTick: () => {
-    runIntegration();
-  },
-  start: true,
-  timeZone: 'Europe/Amsterdam'
-})
+if (process.env.ENABLE_CRON === 'true') {
+  CronJob.from({
+    cronTime: '0 * * * * *', // Run every minute
+    runOnInit: true,
+    onTick: () => {
+      runIntegration();
+    },
+    start: true,
+    timeZone: 'Europe/Amsterdam'
+  })
+}
 
 // Cron job for cleanup orphaned deals at midnight, deals that are not in Ridder anymore
-CronJob.from({ 
-  cronTime: '0 0 0 * * *',  // Run at midnight every day
-  onTick: () => {
-    cleanupOrphanedDeals();
-  },
-  runOnInit: true,
-  start: true,
-  timeZone: 'Europe/Amsterdam'
-});
+if (process.env.ENABLE_CRON === 'true') {
+  CronJob.from({ 
+    cronTime: '0 0 0 * * *',  // Run at midnight every day
+    onTick: () => {
+      cleanupOrphanedDeals();
+    },
+    runOnInit: true,
+    start: true,
+    timeZone: 'Europe/Amsterdam'
+  });
+}
 
 // Cron job for checking direct orders with zero amount
-CronJob.from({
-  cronTime: '0 0 2 * * *',  // Run at 2:00 AM every day
-  onTick: async () => {
-    console.log('Starting daily check for direct orders with zero amount...');
-    try {
-      const updatedCount = await checkDirectOrdersWithZeroAmount(limiter, searchLimiter);
-      console.log(`Direct orders check completed: ${updatedCount} deals with zero amount were deleted`);
-    } catch (error) {
-      console.error('Error during direct orders check:', error);
-      Sentry.captureException(error);
-    }
-  },
-  runOnInit: true,
-  start: true,
-  timeZone: 'Europe/Amsterdam'
-});
+if (process.env.ENABLE_CRON === 'true') {
+  CronJob.from({
+    cronTime: '0 0 2 * * *',  // Run at 2:00 AM every day
+    onTick: async () => {
+      console.log('Starting daily check for direct orders with zero amount...');
+      try {
+        const updatedCount = await checkDirectOrdersWithZeroAmount(limiter, searchLimiter);
+        console.log(`Direct orders check completed: ${updatedCount} deals with zero amount were deleted`);
+      } catch (error) {
+        console.error('Error during direct orders check:', error);
+        Sentry.captureException(error);
+      }
+    },
+    runOnInit: true,
+    start: true,
+    timeZone: 'Europe/Amsterdam'
+  });
+}
 
 // app.get('/update-relations', async (req, res) => {
 //   const relations = await getAllRelations()
@@ -194,8 +419,26 @@ app.get('/', (req, res) => {
   res.send('Hello world!')
 })
 
+// Manual sync trigger (development only)
+app.post('/run-sync', async (req, res) => {
+  const started = Date.now();
+  try {
+    await runIntegration();
+    return res.json({
+      ok: true,
+      durationMs: Date.now() - started
+    });
+  } catch (e) {
+    console.error('Manual /run-sync failed', e);
+    Sentry.captureException?.(e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // The error handler must be registered before any other error middleware and after all controllers
-app.use(Sentry.Handlers.errorHandler());
+if (process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.errorHandler());
+}
 
 app.listen(process.env.PORT || 3000, () => {
 	console.log(`Unitura Integration listening at http://localhost:${process.env.PORT}`)
